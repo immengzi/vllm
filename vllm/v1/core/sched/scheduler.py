@@ -44,6 +44,7 @@ from vllm.v1.core.sched.output import (
     SchedulerOutput,
 )
 from vllm.v1.core.sched.request_queue import (
+    EffectiveSJFRequestQueue,
     RequestQueue,
     SchedulingPolicy,
     create_request_queue,
@@ -161,10 +162,10 @@ class Scheduler(SchedulerInterface):
             raise ValueError(
                 f"Unknown scheduling policy: {self.scheduler_config.policy}"
             ) from e
-        # Priority queues for requests.
-        self.waiting = create_request_queue(self.policy)
+        # Waiting queues for requests.
+        self.waiting = self._create_waiting_request_queue()
         # requests skipped in waiting flow due async deps or constraints.
-        self.skipped_waiting = create_request_queue(self.policy)
+        self.skipped_waiting = self._create_waiting_request_queue()
         self.running: list[Request] = []
 
         # The request IDs that are finished in between the previous and the
@@ -561,7 +562,7 @@ class Scheduler(SchedulerInterface):
 
         # Next, schedule the WAITING requests.
         if not preempted_reqs and self._pause_state == PauseState.UNPAUSED:
-            step_skipped_waiting = create_request_queue(self.policy)
+            step_skipped_waiting = self._create_waiting_request_queue()
 
             while (self.waiting or self.skipped_waiting) and token_budget > 0:
                 if len(self.running) == self.max_num_running_reqs:
@@ -1662,9 +1663,42 @@ class Scheduler(SchedulerInterface):
         else:
             self.waiting.add_request(request)
 
+    def _create_waiting_request_queue(self) -> RequestQueue:
+        return create_request_queue(
+            self.policy,
+            effective_prefill_cost=self._get_effective_sjf_cost,
+            effective_sjf_max_wait_ms=self.scheduler_config.effective_sjf_max_wait_ms,
+        )
+
+    def _get_effective_sjf_cost(self, request: Request) -> int:
+        num_local_computed_tokens = self.kv_cache_manager.get_num_local_computed_tokens(
+            request
+        )
+        return request.num_tokens - num_local_computed_tokens
+
     def _select_waiting_queue_for_scheduling(self) -> RequestQueue | None:
         if self.policy == SchedulingPolicy.FCFS:
             return self.skipped_waiting or self.waiting or None
+
+        if self.policy == SchedulingPolicy.EFFECTIVE_SJF:
+            queues = [queue for queue in (self.waiting, self.skipped_waiting) if queue]
+            if not queues:
+                return None
+
+            now = time.time()
+            selected_queue, (selected_request, _) = min(
+                (
+                    (
+                        queue,
+                        self._get_effective_sjf_best_request(queue, now),
+                    )
+                    for queue in queues
+                ),
+                key=lambda item: item[1][1],
+            )
+            assert isinstance(selected_queue, EffectiveSJFRequestQueue)
+            selected_queue.pin_request(selected_request)
+            return selected_queue
 
         # PRIORITY mode: compare queue heads when both queues are non-empty.
         if self.waiting and self.skipped_waiting:
@@ -1673,6 +1707,13 @@ class Scheduler(SchedulerInterface):
             return self.waiting if waiting_req < skipped_req else self.skipped_waiting
 
         return self.waiting or self.skipped_waiting or None
+
+    @staticmethod
+    def _get_effective_sjf_best_request(
+        queue: RequestQueue, now: float
+    ) -> tuple[Request, tuple[int, int, float, str]]:
+        assert isinstance(queue, EffectiveSJFRequestQueue)
+        return queue.get_best_request(now)
 
     def _handle_stopped_request(self, request: Request) -> bool:
         """Return True if finished (can be False for resumable requests)."""

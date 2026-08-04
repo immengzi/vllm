@@ -19,7 +19,7 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 RunnerType = Literal["generate", "pooling", "draft"]
-SchedulerPolicy = Literal["fcfs", "priority"]
+SchedulerPolicy = Literal["fcfs", "priority", "effective_sjf"]
 
 
 @config
@@ -112,7 +112,12 @@ class SchedulerConfig:
     - "fcfs" means first come first served, i.e. requests are handled in order 
       of arrival.
     - "priority" means requests are handled based on given priority (lower
-      value means earlier handling) and time of arrival deciding any ties)."""
+      value means earlier handling) and time of arrival deciding any ties).
+    - "effective_sjf" means decoder-only text requests are handled by their
+      remaining local prefill work, with FCFS max-wait aging."""
+
+    effective_sjf_max_wait_ms: int = Field(default=60_000, gt=0)
+    """Maximum wait before an effective-SJF request receives FCFS priority."""
 
     disable_chunked_mm_input: bool = False
     """If set to true and chunked prefill is enabled, we do not want to
@@ -222,6 +227,13 @@ class SchedulerConfig:
         return None if value is None else handler(value)
 
     def __post_init__(self, max_model_len: int, is_encoder_decoder: bool) -> None:
+        if self.policy == "effective_sjf" and (
+            self.is_multimodal_model or is_encoder_decoder
+        ):
+            raise ValueError(
+                "effective_sjf supports decoder-only text generation models only."
+            )
+
         if is_encoder_decoder:
             # Chunked prefill should be disabled for encoder-decoder models.
             self.disable_chunked_mm_input = True
