@@ -226,6 +226,21 @@ class KVCacheManager:
             preempted=request.num_preemptions > 0,
         )
 
+    def _find_longest_local_cache_hit(
+        self, request: Request
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, int] | None:
+        """Find a local cache hit without creating blocks or emitting events."""
+        if not self.prefix_cache_lookup_enabled(request):
+            return None
+        return self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+
+    def get_num_local_computed_tokens(self, request: Request) -> int:
+        """Return exact local cache-hit tokens without mutating scheduler state."""
+        cache_hit = self._find_longest_local_cache_hit(request)
+        return cache_hit[1] if cache_hit is not None else 0
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -243,11 +258,8 @@ class KVCacheManager:
                   Pinned so ``VLLM_PREFIX_CACHE_RETENTION_INTERVAL`` does not drop
                   the junction and defeat cross-request reuse.
         """
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
-        if not self.prefix_cache_lookup_enabled(request):
+        cache_hit = self._find_longest_local_cache_hit(request)
+        if cache_hit is None:
             return self.empty_kv_cache_blocks, 0, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -256,12 +268,7 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens, num_uncached = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
-            )
-        )
+        computed_blocks, num_new_computed_tokens, num_uncached = cache_hit
 
         # When kv_cache_report_mode is "full", emit BlockStored events
         # for the reused prefix cache blocks so that external consumers
@@ -294,6 +301,38 @@ class KVCacheManager:
         blocks = self.create_kv_cache_blocks(computed_blocks)
         return blocks, num_new_computed_tokens, shared_prefix_boundary
 
+    def _find_local_cache_hit_for_connector(
+        self, request: Request
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int, bool] | None:
+        """Find the connector-compatible local hit without side effects."""
+        coordinator = self.coordinator
+        if not (
+            self.kv_cache_config.has_mamba_layers
+            and isinstance(coordinator, HybridKVCacheCoordinator)
+            and coordinator.full_attention_group_id is not None
+            and self.prefix_cache_lookup_enabled(request)
+        ):
+            return None
+
+        fa_group_id = coordinator.full_attention_group_id
+        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
+            request.block_hashes, request.num_tokens - 1
+        )
+        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
+            return None
+        return (
+            computed,
+            per_group_hits[fa_group_id],
+            min(per_group_hits) < per_group_hits[fa_group_id],
+        )
+
+    def get_num_local_computed_tokens_for_connector(self, request: Request) -> int:
+        """Return the connector-compatible local hit without remote probing."""
+        cache_hit = self._find_local_cache_hit_for_connector(request)
+        if cache_hit is None:
+            return self.get_num_local_computed_tokens(request)
+        return cache_hit[1]
+
     def get_computed_blocks_for_connector(
         self, request: Request
     ) -> tuple[KVCacheBlocks, int, int, bool]:
@@ -315,31 +354,14 @@ class KVCacheManager:
             The ``get_computed_blocks`` triple (blocks, number of local computed
             tokens, shared-prefix boundary) plus ``hit_diverged``.
         """
-        coordinator = self.coordinator
-        if not (
-            self.kv_cache_config.has_mamba_layers
-            and isinstance(coordinator, HybridKVCacheCoordinator)
-            and coordinator.full_attention_group_id is not None
-        ):
+        cache_hit = self._find_local_cache_hit_for_connector(request)
+        if cache_hit is None:
             return *self.get_computed_blocks(request), False
 
-        if not self.prefix_cache_lookup_enabled(request):
-            return self.empty_kv_cache_blocks, 0, 0, False
-
-        fa_group_id = coordinator.full_attention_group_id
-        computed, per_group_hits = coordinator.find_longest_cache_hit_per_group(
-            request.block_hashes, request.num_tokens - 1
-        )
-        if any(hit > per_group_hits[fa_group_id] for hit in per_group_hits):
-            # A lagging group hit deeper than full attention means its
-            # full-attention blocks were evicted; use the reconciled boundary
-            # that every group agrees on.
-            return *self.get_computed_blocks(request), False
-
-        num_local = per_group_hits[fa_group_id]
+        computed, num_local, hit_diverged = cache_hit
         blocks = self.create_kv_cache_blocks(computed)
         # Per-group lookups do not detect an uncached shared prefix (boundary 0).
-        return blocks, num_local, 0, min(per_group_hits) < num_local
+        return blocks, num_local, 0, hit_diverged
 
     def allocate_slots(
         self,

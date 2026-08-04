@@ -77,9 +77,15 @@ For each item, its support in vLLM V1 falls into one of the following states:
     and decode phases.
 
 The V1 scheduler supports multiple scheduling policies, including First-Come,
-First-Served (FCFS) and priority-based scheduling (where requests are processed
-based on assigned priority, with FCFS as a tie-breaker), configurable via the
-`--scheduling-policy` argument.
+First-Served (FCFS), priority-based scheduling (where requests are processed
+based on assigned priority, with FCFS as a tie-breaker), and `effective_sjf`.
+`effective_sjf` is for decoder-only text generation: it orders waiting requests
+by their remaining local prefill work after exact local prefix-cache hits. A
+request that waits for `--effective-sjf-max-wait-ms` (60,000 by default) is
+promoted in FCFS order. It does not query remote KV connectors while ranking
+candidates, so remote cache-transfer cost is not part of this policy. The exact
+dynamic ranking scans current waiting candidates on every admission; measure
+scheduler CPU overhead separately from model throughput for deep queues.
 
 ### Hardware
 
