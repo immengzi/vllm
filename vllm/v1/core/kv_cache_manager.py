@@ -193,6 +193,28 @@ class KVCacheManager:
         self.prefix_cache_stats = PrefixCacheStats()
         return stats
 
+    def prefix_cache_lookup_enabled(self, request: Request) -> bool:
+        """Whether a local prefix cache lookup may be run for this request."""
+        return self.enable_caching and not request.skip_reading_prefix_cache
+
+    def _find_longest_local_cache_hit(
+        self, request: Request
+    ) -> tuple[tuple[list[KVCacheBlock], ...], int] | None:
+        """Find a local cache hit without creating blocks or emitting events."""
+        if not self.prefix_cache_lookup_enabled(request):
+            return None
+        return self.coordinator.find_longest_cache_hit(
+            request.block_hashes, request.num_tokens - 1
+        )
+
+    def get_num_local_computed_tokens(self, request: Request) -> int:
+        """Return the number of locally cached KV tokens without mutating state."""
+        cache_hit = self._find_longest_local_cache_hit(request)
+        if cache_hit is None:
+            return 0
+        _, hit_length = cache_hit
+        return hit_length
+
     def get_computed_blocks(self, request: Request) -> tuple[KVCacheBlocks, int]:
         """Get the computed (cached) blocks for the request.
         Note that the computed blocks must be full.
@@ -205,11 +227,8 @@ class KVCacheManager:
                 - A list of blocks that are computed for the request.
                 - The number of computed tokens.
         """
-        # We skip finding the prefix cache hit when prefix caching is
-        # disabled or the request is marked as skipping kv cache read
-        # (which happens when the request requires prompt logprobs
-        # or calls a pooling model with all pooling).
-        if not self.enable_caching or request.skip_reading_prefix_cache:
+        cache_hit = self._find_longest_local_cache_hit(request)
+        if cache_hit is None:
             return self.empty_kv_cache_blocks, 0
 
         # NOTE: When all tokens hit the cache, we must recompute the last token
@@ -218,12 +237,7 @@ class KVCacheManager:
         # the single last token, because allocate_slots() requires
         # num_computed_tokens to be block-size aligned. Removing this limitation
         # could slightly improve performance in the future.
-        max_cache_hit_length = request.num_tokens - 1
-        computed_blocks, num_new_computed_tokens = (
-            self.coordinator.find_longest_cache_hit(
-                request.block_hashes, max_cache_hit_length
-            )
-        )
+        computed_blocks, num_new_computed_tokens = cache_hit
 
         if self.log_stats:
             assert self.prefix_cache_stats is not None
