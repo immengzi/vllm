@@ -1,0 +1,50 @@
+commit 82536acc54fc8d828b0d8add9d093aee0da1370e
+Author: Gabriel Wu <13583761+lucifer1004@users.noreply.github.com>
+Date:   Sat May 23 14:23:32 2026 +0800
+
+    Keep scheduler alive for delayed KV connector frees (#43433)
+    
+    Signed-off-by: Zihua Wu <13583761+lucifer1004@users.noreply.github.com>
+
+diff --git a/vllm/v1/core/sched/scheduler.py b/vllm/v1/core/sched/scheduler.py
+index 45a5169a3e..c69c9a8119 100644
+--- a/vllm/v1/core/sched/scheduler.py
++++ b/vllm/v1/core/sched/scheduler.py
+@@ -1882,7 +1882,16 @@ class Scheduler(SchedulerInterface):
+         return num_waiting + len(self.running)
+ 
+     def has_finished_requests(self) -> bool:
+-        return len(self.finished_req_ids) > 0
++        if self.finished_req_ids:
++            return True
++        if self.connector is None:
++            return False
++        # Finished requests waiting on delayed connector cleanup remain in
++        # self.requests after they have been removed from scheduling queues.
++        num_in_queues = (
++            len(self.waiting) + len(self.skipped_waiting) + len(self.running)
++        )
++        return len(self.requests) > num_in_queues
+ 
+     def reset_prefix_cache(
+         self, reset_running_requests: bool = False, reset_connector: bool = False
+diff --git a/vllm/v1/engine/core.py b/vllm/v1/engine/core.py
+index 8c5fe71ed2..c9503e46dd 100644
+--- a/vllm/v1/engine/core.py
++++ b/vllm/v1/engine/core.py
+@@ -1242,11 +1242,10 @@ class EngineCoreProc(EngineCore):
+         # Post-step hook.
+         self.post_step(model_executed)
+ 
+-        # If no model execution happened but there are waiting requests
+-        # (e.g., WAITING_FOR_REMOTE_KVS), yield the GIL briefly to allow
+-        # background threads (like NIXL handshake) to make progress.
+-        # Without this, the tight polling loop can starve background threads.
+-        if not model_executed and self.scheduler.has_unfinished_requests():
++        # If no model execution happened but there is still scheduler work
++        # (e.g. WAITING_FOR_REMOTE_KVS or delayed KV connector frees), yield
++        # the GIL briefly to allow background transfer threads to make progress.
++        if not model_executed and self.scheduler.has_requests():
+             time.sleep(0.001)
+ 
+         return model_executed
